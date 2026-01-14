@@ -1,0 +1,102 @@
+bundle:
+  name: enzyme-demo
+
+variables:
+  catalog:
+    description: "Unity Catalog name"
+    default: main
+  schema:
+    description: "Schema for source tables and pipeline output"
+    default: enzyme_demo
+  warehouse_id:
+    description: "SQL warehouse ID for notebook tasks"
+    default: ""
+
+resources:
+  schemas:
+    enzyme_demo_schema:
+      catalog_name: ${var.catalog}
+      name: ${var.schema}
+
+  pipelines:
+    mv_transformations:
+      name: enzyme-demo-mv-transformations
+      catalog: ${var.catalog}
+      target: ${var.schema}
+      serverless: true
+      channel: CURRENT
+      libraries:
+        - file:
+            path: ./src/mv_transformations.sql
+
+  jobs:
+    enzyme_demo_job:
+      name: enzyme-demo-orchestration
+      tasks:
+        # Step 1: Create initial source tables (customers, products, sales)
+        - task_key: create_sources
+          notebook_task:
+            notebook_path: ./src/notebooks/create_tables.sql
+            source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+
+        # Step 2: First pipeline update — full refresh to materialize all MVs
+        - task_key: pipeline_initial_refresh
+          depends_on:
+            - task_key: create_sources
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.mv_transformations.id}
+            full_refresh: true
+
+        # Step 3: Small incremental changes (~250 rows across scenarios)
+        - task_key: update_sources_incremental
+          depends_on:
+            - task_key: pipeline_initial_refresh
+          notebook_task:
+            notebook_path: ./src/notebooks/update_tables.sql
+            source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+
+        # Step 4: Pipeline incremental refresh — Enzyme processes only changed data
+        - task_key: pipeline_incremental_refresh
+          depends_on:
+            - task_key: update_sources_incremental
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.mv_transformations.id}
+            full_refresh: false
+
+        # Step 5: Large update — correct 10% of all sales prices (bulk backfill)
+        - task_key: update_sources_bulk
+          depends_on:
+            - task_key: pipeline_incremental_refresh
+          notebook_task:
+            notebook_path: ./src/notebooks/update_tables_full_recompute.sql
+            source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+
+        # Step 6: Pipeline update — cost model detects bulk change and triggers full recompute
+        - task_key: pipeline_cost_model_recompute
+          depends_on:
+            - task_key: update_sources_bulk
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.mv_transformations.id}
+            full_refresh: false
+
+targets:
+  default:
+    default: true
+    workspace:
+      host: ${DATABRICKS_HOST}
+    variables:
+      catalog: main
+      schema: enzyme_demo
+      warehouse_id: ${DATABRICKS_WAREHOUSE_ID}
